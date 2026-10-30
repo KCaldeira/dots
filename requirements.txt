@@ -1,0 +1,8 @@
+# Numerics: positions, velocities, pairwise distances
+numpy
+# Fast neighbour lookups (cKDTree) if interactions are limited to a radius
+scipy
+# Real-time interactive animation window
+pygame
+# Quick plots and saving animations to MP4/GIF
+matplotlib
