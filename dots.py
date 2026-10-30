@@ -26,7 +26,9 @@ Two kinds of dynamics (press m to switch):
                 momentum), passed through the same speed limit.
 
 Dots are coloured by speed: blue when still, through purple and red, to
-yellow at V_MAX.
+yellow at V_MAX.  Each dot leaves a fading trail: every frame, the previous
+picture is blended towards the background by the factor TRAIL_KEEP, so a
+mark fades exponentially (TRAIL_KEEP = 0 means no trails).
 
 Keys:
     space   pause / resume
@@ -35,6 +37,7 @@ Keys:
     s / x   increase / decrease repulsion
     m       switch between acceleration and velocity dynamics (this
             also resets the strengths to that mode's defaults)
+    t / g   longer / shorter trails
     esc     quit
 """
 
@@ -58,6 +61,11 @@ R0 = 20.0            # reference distance for both terms (pixels)
 R_CUT = 120.0        # neighbours farther than this are ignored (pixels)
 V_MAX = 4.0          # speed limit, pixels per frame
 SUBSTEPS = 10        # integration steps per frame, acceleration dynamics
+
+# Fraction of each pixel's brightness (above the background) kept from one
+# frame to the next.  A mark fades to half in log(0.5) / log(TRAIL_KEEP)
+# frames: about 8 frames at 0.92.
+TRAIL_KEEP = 0.92
 
 FPS = 60
 BACKGROUND = (15, 15, 25)
@@ -139,7 +147,14 @@ def main():
     p = np.zeros_like(pos)
     dynamics = DYNAMICS
     attraction, repulsion = ATTRACTION[dynamics], REPULSION[dynamics]
+    trail_keep = TRAIL_KEEP
     paused = False
+
+    # Picture of the dots so far, in floating point so that faint trails
+    # keep fading smoothly instead of getting stuck by 8-bit rounding.
+    background = np.array(BACKGROUND, dtype=np.float32)
+    trails = np.empty((WIDTH, HEIGHT, 3), dtype=np.float32)
+    trails[:] = background
 
     running = True
     while running:
@@ -154,6 +169,7 @@ def main():
                 elif event.key == pygame.K_r:
                     pos = scatter(rng, N_DOTS)
                     p = np.zeros_like(pos)
+                    trails[:] = background
                 elif event.key == pygame.K_m:
                     dynamics = ("velocity" if dynamics == "acceleration"
                                 else "acceleration")
@@ -167,15 +183,27 @@ def main():
                     repulsion *= 1.25
                 elif event.key == pygame.K_x:
                     repulsion /= 1.25
+                elif event.key == pygame.K_t:
+                    # Halve the fade rate: trails twice as long.
+                    trail_keep = 1 - (1 - trail_keep) / 2
+                elif event.key == pygame.K_g:
+                    trail_keep = max(0.0, 1 - (1 - trail_keep) * 2)
 
         if not paused:
             pos, p = step(pos, p, dynamics, attraction, repulsion)
+            trails -= background
+            trails *= trail_keep
+            trails += background
 
-        screen.fill(BACKGROUND)
+        # Draw the faded picture, add the dots, and keep the result (without
+        # the status text) as the starting point for the next frame.
+        pygame.surfarray.blit_array(screen, trails.astype(np.uint8))
         for (x, y), colour in zip(pos, speed_colours(p)):
             pygame.draw.circle(screen, colour, (int(x), int(y)), DOT_RADIUS)
+        trails[:] = pygame.surfarray.pixels3d(screen)
+
         status = (f"{dynamics}   attraction {attraction:.2f}"
-                  f"   repulsion {repulsion:.2f}"
+                  f"   repulsion {repulsion:.2f}   trail {trail_keep:.3f}"
                   f"{'   [paused]' if paused else ''}")
         screen.blit(font.render(status, True, TEXT_COLOUR), (10, 10))
         pygame.display.flip()
