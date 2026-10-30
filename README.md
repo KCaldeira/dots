@@ -40,6 +40,32 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+## Running
+
+```bash
+python dots.py
+```
+
+`dots.py` is a first pygame prototype: dots attract (falling off as 1/r²) and
+repel (falling off as 1/r⁴), so attraction wins at long range and repulsion
+at short range. Only neighbours within a cutoff radius interact. The edges
+wrap around (a torus).
+
+Two kinds of dynamics, switched with `m`:
+
+- **acceleration** (default): the interactions accelerate the dots, with no
+  friction. Speed is limited softly to `V_MAX` by
+  `speed = V_MAX * (1 - exp(-|p| / V_MAX))`, a kind of "speed of light", so
+  dots get harder to speed up as they approach it. Without friction the
+  dots never settle; they behave like a gas.
+- **velocity**: the interactions set the velocity directly, so the dots
+  slide into clusters and stop.
+
+Dots are coloured by speed: blue when still, through purple and red, to
+yellow at the speed limit. Keys: space pauses, `r` re-scatters, `a`/`z` and
+`s`/`x` raise and lower attraction and repulsion, `m` switches dynamics,
+esc quits. The rule and parameters are at the top of the file.
+
 ## Status
 
-Stub. Nothing to run yet.
+Early prototype.
