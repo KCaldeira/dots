@@ -27,8 +27,8 @@ Two kinds of dynamics (press m to switch):
 
 Dots are coloured by speed: blue when still, through purple and red, to
 yellow at V_MAX.  Each dot leaves a fading trail: every frame, the previous
-picture is blended towards the background by the factor TRAIL_KEEP, so a
-mark fades exponentially (TRAIL_KEEP = 0 means no trails).
+picture is multiplied by the factor TRAIL_KEEP, so a mark fades
+exponentially to black (TRAIL_KEEP = 0 means no trails).
 
 Keys:
     space   pause / resume
@@ -43,9 +43,10 @@ Keys:
 
 import numpy as np
 import pygame
+from scipy.spatial import cKDTree
 
-WIDTH, HEIGHT = 900, 700
-N_DOTS = 150
+WIDTH, HEIGHT = 1920, 1080
+N_DOTS = 500
 DOT_RADIUS = 3
 
 DYNAMICS = "acceleration"    # or "velocity"
@@ -62,13 +63,13 @@ R_CUT = 120.0        # neighbours farther than this are ignored (pixels)
 V_MAX = 4.0          # speed limit, pixels per frame
 SUBSTEPS = 10        # integration steps per frame, acceleration dynamics
 
-# Fraction of each pixel's brightness (above the background) kept from one
+# Fraction of each pixel's brightness kept from one
 # frame to the next.  A mark fades to half in log(0.5) / log(TRAIL_KEEP)
 # frames: about 8 frames at 0.92.
 TRAIL_KEEP = 0.92
 
 FPS = 60
-BACKGROUND = (15, 15, 25)
+BACKGROUND = (0, 0, 0)   # trails fade to black, so this must stay black
 # Colour stops from still (0) to V_MAX (1).
 SPEED_STOPS = [0.0, 0.33, 0.66, 1.0]
 SPEED_COLOURS = np.array([(60, 90, 255),     # blue
@@ -85,20 +86,29 @@ def scatter(rng, n):
 
 def interactions(pos, attraction, repulsion):
     """Summed interaction on every dot, from its distances to the others."""
-    # Pairwise separation vectors d[i, j] = pos[j] - pos[i], using the
-    # nearest periodic image so dots interact across the wrapped edges.
-    d = pos[np.newaxis, :, :] - pos[:, np.newaxis, :]
+    # Find the pairs closer than R_CUT with a k-d tree on the torus, so only
+    # those pairs are computed (all pairs would be far slower).
     size = np.array([WIDTH, HEIGHT])
+    pos = pos % size
+    pos[pos >= size] = 0.0               # float rounding can give exactly size
+    i, j = cKDTree(pos, boxsize=size).query_pairs(
+        R_CUT, output_type="ndarray").T
+
+    # Separation vectors d = pos[j] - pos[i], using the nearest periodic
+    # image so dots interact across the wrapped edges.
+    d = pos[j] - pos[i]
     d -= size * np.round(d / size)
 
-    r = np.hypot(d[..., 0], d[..., 1])
-    np.fill_diagonal(r, np.inf)          # no self-interaction
+    r = np.hypot(d[:, 0], d[:, 1])
     r = np.maximum(r, 1.0)               # avoid blow-up when dots overlap
 
     f = attraction * (R0 / r) ** 2 - repulsion * (R0 / r) ** 4
-    f[r > R_CUT] = 0.0
+    pull = (f / r)[:, np.newaxis] * d
 
-    return np.sum((f / r)[..., np.newaxis] * d, axis=1)
+    # Each pair pulls i towards j and j towards i, equally and oppositely.
+    n = len(pos)
+    return np.stack([np.bincount(i, pull[:, c], n)
+                     - np.bincount(j, pull[:, c], n) for c in range(2)], axis=1)
 
 
 def speed_limit(v):
@@ -117,6 +127,20 @@ def speed_colours(p):
     fraction = np.hypot(v[:, 0], v[:, 1]) / V_MAX
     return np.stack([np.interp(fraction, SPEED_STOPS, SPEED_COLOURS[:, c])
                      for c in range(3)], axis=1).astype(int)
+
+
+def fade(surface, keep):
+    """Multiply every pixel of a 32-bit surface by keep, in place."""
+    # Work on whole 32-bit pixels: the 1st and 3rd colour bytes together,
+    # then the 2nd, each with room above it for the multiplication.  This
+    # is several times faster than handling the channels separately.
+    # Rounding down means faint trails always reach 0 instead of sticking.
+    a = np.uint32(min(255, round(keep * 256)))
+    px = pygame.surfarray.pixels2d(surface)    # locks surface until deleted
+    outer = (((px & 0xFF00FF) * a) >> 8) & 0xFF00FF
+    middle = (((px & 0x00FF00) * a) >> 8) & 0x00FF00
+    px[:] = outer | middle
+    del px
 
 
 def step(pos, p, dynamics, attraction, repulsion):
@@ -150,11 +174,9 @@ def main():
     trail_keep = TRAIL_KEEP
     paused = False
 
-    # Picture of the dots so far, in floating point so that faint trails
-    # keep fading smoothly instead of getting stuck by 8-bit rounding.
-    background = np.array(BACKGROUND, dtype=np.float32)
-    trails = np.empty((WIDTH, HEIGHT, 3), dtype=np.float32)
-    trails[:] = background
+    # Picture of the dots so far, faded a little each frame.
+    trails = pygame.Surface((WIDTH, HEIGHT), depth=32)
+    trails.fill(BACKGROUND)
 
     running = True
     while running:
@@ -169,7 +191,7 @@ def main():
                 elif event.key == pygame.K_r:
                     pos = scatter(rng, N_DOTS)
                     p = np.zeros_like(pos)
-                    trails[:] = background
+                    trails.fill(BACKGROUND)
                 elif event.key == pygame.K_m:
                     dynamics = ("velocity" if dynamics == "acceleration"
                                 else "acceleration")
@@ -191,16 +213,11 @@ def main():
 
         if not paused:
             pos, p = step(pos, p, dynamics, attraction, repulsion)
-            trails -= background
-            trails *= trail_keep
-            trails += background
+            fade(trails, trail_keep)
 
-        # Draw the faded picture, add the dots, and keep the result (without
-        # the status text) as the starting point for the next frame.
-        pygame.surfarray.blit_array(screen, trails.astype(np.uint8))
         for (x, y), colour in zip(pos, speed_colours(p)):
-            pygame.draw.circle(screen, colour, (int(x), int(y)), DOT_RADIUS)
-        trails[:] = pygame.surfarray.pixels3d(screen)
+            pygame.draw.circle(trails, colour, (int(x), int(y)), DOT_RADIUS)
+        screen.blit(trails, (0, 0))
 
         status = (f"{dynamics}   attraction {attraction:.2f}"
                   f"   repulsion {repulsion:.2f}   trail {trail_keep:.3f}"

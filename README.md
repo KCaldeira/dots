@@ -16,8 +16,9 @@ pip install -r requirements.txt
 python dots.py
 ```
 
-Everything is in `dots.py` (Python, numpy and pygame). The rule and all the
-parameters are at the top of the file.
+Everything is in `dots.py` (Python, with numpy, scipy and pygame). The rule
+and all the parameters are at the top of the file. The window is 1920 × 1080
+with 500 dots.
 
 ### Keys
 
@@ -50,8 +51,9 @@ Attraction falls off as 1/r² and repulsion as 1/r⁴, so repulsion wins at
 short range and attraction at long range. Positive `f` pulls a dot towards
 its neighbour; negative `f` pushes it away. For a single pair the forces
 balance at `r = R0 * sqrt(REPULSION / ATTRACTION)` (20 px with the
-defaults). Dots farther apart than `R_CUT` (120 px) ignore each other. All
-pairs are computed at once with numpy.
+defaults). Dots farther apart than `R_CUT` (120 px) ignore each other, so
+only nearby pairs are computed: a k-d tree (`scipy.spatial.cKDTree`, which
+understands the wrapped edges) finds them, and numpy sums the forces.
 
 ### Geometry
 
@@ -86,11 +88,11 @@ dots get harder to speed up as they approach the limit.
 
 - **Colour by speed:** blue when still, through purple and red, to yellow
   at `V_MAX`.
-- **Fading trails:** each frame, the previous picture's brightness above the
-  background is multiplied by `TRAIL_KEEP` (0.92), so a mark fades
-  exponentially, to half in about 8 frames. The picture is kept in floating
-  point so faint trails fade all the way out instead of sticking as dim
-  ghosts from 8-bit rounding.
+- **Fading trails:** each frame, the previous picture's brightness is
+  multiplied by `TRAIL_KEEP` (0.92), so a mark fades exponentially to black,
+  to half in about 8 frames. The multiplication works on whole 32-bit pixels
+  in place and rounds down, so it is fast and faint trails always fade all
+  the way out instead of sticking as dim ghosts.
 
 ## What we have found
 
@@ -108,9 +110,10 @@ dots get harder to speed up as they approach the limit.
   extra energy. The 10 substeps per frame and the speed limit together keep
   it bounded. Energy still creeps up slowly (by roughly 50–200% over 30
   seconds), so the gas gradually heats.
-- **Performance:** with 150 dots, a frame takes about 29 ms (about 35 frames
-  per second), mostly in the 10 force calculations per frame. Fewer
-  substeps or fewer dots would speed it up.
+- **Performance:** at 1920 × 1080 with 500 dots, a frame takes about 21 ms
+  (about 48 frames per second): roughly 8 ms for the physics and 9 ms for
+  the trails. Computing all pairs instead of only nearby ones would take
+  about 210 ms per frame, and the earlier floating-point trails about 45 ms.
 
 ## Possible next steps
 
