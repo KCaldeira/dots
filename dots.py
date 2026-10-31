@@ -39,7 +39,9 @@ exponentially to black (TRAIL_KEEP = 0 means no trails).
 
 The window is split into 1, 2 (side by side) or 4 (2 x 2) panels, each a
 separate world sized to fill its share, with DOT_DENSITY dots per pixel of
-area.
+area.  With --tile F, one world fills the centre of the window, a fraction F
+of its width and height (default 0.5), and copies of it surround it on all
+sides, so dots and clumps can be followed as they wrap around the torus.
 
 Dots start on a near-hexagonal grid (so only certain dot counts fit; the
 status line shows the actual number) with random starting velocities of a
@@ -61,6 +63,10 @@ Usage:
                                          second, if there is one)
     python dots.py --cutoff on           ignore pairs farther than R_CUT
     python dots.py --cutoff compare      cutoff (left) vs none (right)
+    python dots.py --tile                one world in the middle, surrounded
+                                         by copies showing the wrapping
+    python dots.py --tile 0.75           the same with a larger world and a
+                                         narrower border of copies
     python dots.py --record dots.mp4     write a 60 s 1920 x 1080 video for
                                          YouTube instead of showing a window
                                          (--seconds and --size change it)
@@ -128,6 +134,7 @@ SPEED_COLOURS = np.array([(60, 90, 255),     # blue
 TEXT_COLOUR = (160, 160, 170)
 DIVIDER = 2                  # width of the lines between panels (pixels)
 DIVIDER_COLOUR = (60, 60, 70)
+TILE_OUTLINE = (90, 90, 100)  # outline of the central world with --tile
 
 
 def n_dots():
@@ -155,6 +162,15 @@ def random_momenta(rng, n, vrms):
     p -= p.mean(axis=0)                  # no overall drift of the world
     rms = np.sqrt(np.mean(np.sum(p ** 2, axis=1)))
     return p * (vrms / rms) if rms > 0 else np.zeros((n, 2))
+
+
+def tile_fraction(text):
+    """Parse a fraction of the window, more than 0 and at most 1."""
+    value = float(text)
+    if not 0 < value <= 1:
+        raise argparse.ArgumentTypeError(f"must be more than 0 and at most 1, "
+                                         f"got {text}")
+    return value
 
 
 def positive(text):
@@ -203,6 +219,24 @@ def interactions(pos, attraction, repulsion):
     n = len(pos)
     return np.stack([np.bincount(i, pull[:, c], n)
                      - np.bincount(j, pull[:, c], n) for c in range(2)], axis=1)
+
+
+def draw_dots(surface, pos, colours):
+    """Draw the dots, wrapping any that cross an edge onto the other side."""
+    for (x, y), colour in zip(pos, colours):
+        x, y = int(x), int(y)
+        xs, ys = [x], [y]
+        if x < DOT_RADIUS:
+            xs.append(x + WIDTH)
+        elif x >= WIDTH - DOT_RADIUS:
+            xs.append(x - WIDTH)
+        if y < DOT_RADIUS:
+            ys.append(y + HEIGHT)
+        elif y >= HEIGHT - DOT_RADIUS:
+            ys.append(y - HEIGHT)
+        for xx in xs:
+            for yy in ys:
+                pygame.draw.circle(surface, colour, (xx, yy), DOT_RADIUS)
 
 
 def speed_limit(v):
@@ -396,6 +430,11 @@ def main():
                         "ignore each other (faster); compare: two panels "
                         "with identical starts, cutoff on the left and none "
                         "on the right")
+    parser.add_argument("--tile", type=tile_fraction, nargs="?", const=0.5,
+                        metavar="F", help="one world in the centre of the "
+                        "window, a fraction F of its width and height "
+                        "(default 0.5), surrounded by copies of itself to "
+                        "show the wrapping; --panels 1 only")
     parser.add_argument("-d", "--display", type=int,
                         help="which monitor to use, counting from 0 "
                         "(default 1, or 0 if there is only one)")
@@ -408,6 +447,9 @@ def main():
     args = parser.parse_args()
     if args.cutoff == "compare":
         args.panels = 2
+    if args.tile is not None and args.panels != 1:
+        parser.error("--tile works only with one panel (not with --panels 2 "
+                     "or 4, or --cutoff compare)")
     cols, rows = LAYOUTS[args.panels]
     if args.record:
         args.size = args.size or (1920, 1080)
@@ -436,6 +478,20 @@ def main():
     DOT_DENSITY *= args.density
     corners = [(c * (WIDTH + DIVIDER), r * (HEIGHT + DIVIDER))
                for r in range(rows) for c in range(cols)]
+    if args.tile is not None:
+        # The world is a fraction of the window, centred; its copies are
+        # drawn whole world-widths and -heights away in every direction,
+        # as many as it takes to reach the window edges (one each way unless
+        # the fraction is below 1/3).
+        WIDTH = round(screen_w * args.tile)
+        HEIGHT = round(screen_h * args.tile)
+        x0, y0 = (screen_w - WIDTH) // 2, (screen_h - HEIGHT) // 2
+        corners = [(x0, y0)]
+        nx, ny = -(-x0 // WIDTH), -(-y0 // HEIGHT)      # rounded up
+        copies = [(i * WIDTH, j * HEIGHT) for j in range(-ny, ny + 1)
+                  for i in range(-nx, nx + 1)]
+    else:
+        copies = [(0, 0)]
     pygame.display.set_caption("dots")
     clock = pygame.time.Clock()
     font = pygame.font.SysFont(None, 22)
@@ -458,6 +514,7 @@ def main():
     if args.record:
         total_frames = round(args.seconds * FPS)
         settings = (f"{args.panels} panels, {len(worlds[0])} dots each, "
+                    f"{f'tile {args.tile:g}, ' if args.tile else ''}"
                     f"cutoff {args.cutoff}, start {args.start}, "
                     f"vrms {args.vrms}, "
                     f"density {args.density}, seed {seed}")
@@ -507,18 +564,19 @@ def main():
                     elif event.key == pygame.K_g:
                         trail_keep = max(0.0, 1 - (1 - trail_keep) * 2)
 
-            screen.fill(DIVIDER_COLOUR)
+            screen.fill(BACKGROUND if args.tile is not None else DIVIDER_COLOUR)
             for k, corner in enumerate(corners):
                 if not paused:
                     worlds[k], momenta[k] = step(worlds[k], momenta[k],
                                                  dynamics, attraction,
                                                  repulsion, cutoffs[k])
                     fade(trails[k], trail_keep)
-                colours = speed_colours(momenta[k])
-                for (x, y), colour in zip(worlds[k], colours):
-                    pygame.draw.circle(trails[k], colour, (int(x), int(y)),
-                                       DOT_RADIUS)
-                screen.blit(trails[k], corner)
+                draw_dots(trails[k], worlds[k], speed_colours(momenta[k]))
+                for dx, dy in copies:
+                    screen.blit(trails[k], (corner[0] + dx, corner[1] + dy))
+            if args.tile is not None:
+                pygame.draw.rect(screen, TILE_OUTLINE,
+                                 (*corners[0], WIDTH, HEIGHT), 1)
 
             # Panel labels, shown in videos too.
             for label, (x, y) in zip(labels, corners):

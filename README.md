@@ -40,6 +40,7 @@ so a run you like can be repeated with `--seed`.
 | `-p`, `--panels {1,2,4}` | number of worlds: 1, 2 (side by side) or 4 (2 × 2); default 1 |
 | `--vrms V` | rms starting velocity, px/frame (default 0.5). With `--cutoff on`, about 1.25 or less gives clumps in a gas; 1.5 or more stays a gas |
 | `--cutoff {off,on,compare}` | `off` (default): every pair interacts. `on`: dots more than 120 px apart ignore each other (faster). `compare`: two panels with identical starts, cutoff on the left and none on the right |
+| `--tile [F]` | one world in the centre of the window, a fraction `F` of its width and height (default 0.5), surrounded by copies of itself, so you can watch dots wrap around the torus. One panel only |
 | `--start {hex,random}` | starting layout: hexagonal grid (default) or random scatter |
 | `--seed N` | random seed for panel 1; panel *k* uses seed + *k* (default: random, shown in the status line) |
 | `--density X` | dot density as a multiple of 500 dots per 1920 × 1080 (default 1) |
@@ -61,6 +62,11 @@ python dots.py --panels 4
 # no-cutoff side quickly forms a few big, hot clumps; the cutoff side many
 # small ones.
 python dots.py --cutoff compare --seed 7
+
+# One world in the middle of the screen, outlined, surrounded by copies of
+# itself: clumps and trails can be followed across the wrapped edges.
+python dots.py --tile --seed 3          # world is half the width and height
+python dots.py --tile 0.75 --seed 3     # larger world, narrower border
 
 # Compare starting temperatures (thresholds measured this way: four
 # panels, cutoff on).
@@ -207,6 +213,12 @@ top and bottom. Dots leaving one edge reappear on the opposite one, and
 distances are measured the short way around (the nearest periodic image),
 so dots interact across the edges. This is exact while `R_CUT` is less than
 half the smaller window side.
+
+With `--tile F` the world is drawn in the middle of the window, a fraction
+`F` of its width and height (default 0.5), with copies around it (cut off by
+the window edges), so the wrapping can be seen directly. At the same density
+the world has `F²` as many dots as a full window: a quarter at 0.5, about
+half (0.56) at 0.75.
 
 ### Dynamics
 
