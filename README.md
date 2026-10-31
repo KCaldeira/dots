@@ -42,6 +42,7 @@ so a run you like can be repeated with `--seed`.
 | `--cutoff {off,on,compare}` | `off` (default): every pair interacts. `on`: dots more than 120 px apart ignore each other (faster). `compare`: two panels with identical starts, cutoff on the left and none on the right |
 | `--tile [F]` | one world in the centre of the window, a fraction `F` of its width and height (default 0.5), surrounded by copies of itself, so you can watch dots wrap around the torus. One panel only |
 | `--start {hex,random,empty}` | starting layout: hexagonal grid (default), random scatter, or no dots |
+| `--remove-every S` | remove one dot chosen at random every `S` seconds. With `--seconds`, start with about seconds ÷ `S` dots (this sets the density), and end a recording `S` seconds after the last dot has gone |
 | `--add-every S` | add one dot at rest at a random place every `S` seconds of simulated time (60 frames per second), e.g. `0.1` |
 | `--seed N` | random seed for panel 1; panel *k* uses seed + *k* (default: random, shown in the status line) |
 | `--density X` | dot density as a multiple of 500 dots per 1920 × 1080 (default 1) |
@@ -72,6 +73,11 @@ python dots.py --tile 0.75 --seed 3     # larger world, narrower border
 # Start empty and add a dot at rest every 0.1 s: 600 dots after a minute.
 # Without the cutoff they gather into one big hot clump in a gas.
 python dots.py --start empty --add-every 0.1 --seed 3
+
+# The reverse: start with about 3000 dots on the grid (300 s / 0.1 s) and
+# remove one at random every 0.1 s until none are left.
+python dots.py --remove-every 0.1 --seconds 300 --tile 0.75 --seed 42 \
+    --record shrink_0.1_42.mp4
 
 # Compare starting temperatures (thresholds measured this way: four
 # panels, cutoff on).
@@ -107,7 +113,7 @@ real time.
 | Option | Meaning |
 | --- | --- |
 | `--record FILE` | write an MP4 video to `FILE` |
-| `--seconds S` | length of the video, at 60 frames per second (default 60) |
+| `--seconds S` | length of the video, at 60 frames per second (default 60, or until the dots run out with `--remove-every`) |
 | `--size WxH` | video size (default `1920x1080`; must be even in both directions) |
 
 All the other options work as usual. The settings and seed are printed when

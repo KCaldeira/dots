@@ -55,7 +55,10 @@ shows the seed, so a run can be repeated with --seed.
 With --start empty the world starts with no dots, and --add-every S adds
 one dot at rest at a random place every S seconds (of simulated time, at
 FPS frames per second, so videos and live runs match).  --add-every works
-with the other starts too.
+with the other starts too.  The reverse, --remove-every S, deletes one dot
+chosen at random every S seconds; given --seconds as well, the world starts
+with about seconds / S dots (so it empties after about that long), and a
+recording ends S seconds after the last dot has gone.
 
 Usage:
     python dots.py                       fullscreen, one world
@@ -67,6 +70,9 @@ Usage:
     python dots.py --start empty --add-every 0.1
                                          start with no dots and add one at
                                          rest every 0.1 s
+    python dots.py --remove-every 0.1 --seconds 300
+                                         start with about 3000 dots on the
+                                         grid and remove one every 0.1 s
     python dots.py --display 0           on the first monitor (default: the
                                          second, if there is one)
     python dots.py --cutoff on           ignore pairs farther than R_CUT
@@ -436,6 +442,11 @@ def main():
     parser.add_argument("--add-every", type=positive, metavar="S",
                         help="add one dot at rest at a random place every S "
                         "seconds, e.g. 0.1 (default: never)")
+    parser.add_argument("--remove-every", type=positive, metavar="S",
+                        help="remove one dot chosen at random every S "
+                        "seconds.  With --seconds, start with about "
+                        "seconds / S dots (setting the density), and end a "
+                        "recording S seconds after the last dot has gone")
     parser.add_argument("--vrms", type=non_negative, default=0.5,
                         help="rms starting velocity in pixels per frame "
                         "(default 0.5).  With --cutoff on and the default "
@@ -461,9 +472,10 @@ def main():
     parser.add_argument("--record", metavar="FILE",
                         help="write an MP4 video to FILE instead of showing "
                         "a window (default size 1920x1080)")
-    parser.add_argument("--seconds", type=positive, default=60.0,
+    parser.add_argument("--seconds", type=positive,
                         help=f"length of the video when recording, at {FPS} "
-                        "frames per second (default 60)")
+                        "frames per second (default 60, or until the dots "
+                        "run out with --remove-every)")
     args = parser.parse_args()
     if args.cutoff == "compare":
         args.panels = 2
@@ -512,6 +524,10 @@ def main():
                   for i in range(-nx, nx + 1)]
     else:
         copies = [(0, 0)]
+    if args.remove_every and args.seconds:
+        # Enough dots to last about --seconds (the hex grid only fits
+        # certain numbers, so it is a little more or less).
+        DOT_DENSITY = (args.seconds / args.remove_every) / (WIDTH * HEIGHT)
     pygame.display.set_caption("dots")
     clock = pygame.time.Clock()
     font = pygame.font.SysFont(None, 22)
@@ -522,11 +538,15 @@ def main():
                                   same)
     frame = 0            # frames simulated since the (re)start
 
-    def dots_due(frames):
-        """Dots to have been added after this many frames (--add-every)."""
+    end_frame = None     # with --remove-every, when to stop recording
+
+    def due(frames, every):
+        """Whether a dot is added or removed at this frame, every S seconds."""
         # The small allowance stops float rounding (0.1 * 60 is just over
-        # 6) from delaying each dot by a frame.
-        return int(frames / (args.add_every * FPS) + 1e-9)
+        # 6) from delaying each by a frame.
+        return (int(frames / (every * FPS) + 1e-9)
+                > int((frames - 1) / (every * FPS) + 1e-9))
+
     if args.cutoff == "compare":
         cutoffs = [True, False]
         labels = [f"{R_CUT:g} px cutoff", "no cutoff"]
@@ -540,17 +560,23 @@ def main():
 
     recorder = None
     if args.record:
-        total_frames = round(args.seconds * FPS)
+        if args.seconds is None and not args.remove_every:
+            args.seconds = 60.0
+        total_frames = round(args.seconds * FPS) if args.seconds else None
         settings = (f"{args.panels} panels, {len(worlds[0])} dots each, "
                     f"{f'tile {args.tile:g}, ' if args.tile else ''}"
                     f"cutoff {args.cutoff}, start {args.start}, "
                     f"vrms {args.vrms}, "
                     + (f"add every {args.add_every:g} s, "
-                       if args.add_every else "") +
+                       if args.add_every else "")
+                    + (f"remove every {args.remove_every:g} s, "
+                       if args.remove_every else "") +
                     f"density {args.density}, seed {seed}")
         recorder = Recorder(args.record, screen.get_size(), settings)
-        print(f"Recording {args.seconds:g} s ({total_frames} frames) at "
-              f"{screen_w}x{screen_h} to {args.record}: {settings}")
+        length = (f"{args.seconds:g} s ({total_frames} frames)"
+                  if not args.remove_every else "until the dots run out")
+        print(f"Recording {length} at {screen_w}x{screen_h} to "
+              f"{args.record}: {settings}")
         frames_written = 0
 
     # Picture of each world's dots so far, faded a little each frame.
@@ -575,6 +601,7 @@ def main():
                                                       args.start, args.vrms,
                                                       same)
                         frame = 0
+                        end_frame = None
                         for surface in trails:
                             surface.fill(BACKGROUND)
                     elif event.key == pygame.K_m:
@@ -601,11 +628,22 @@ def main():
                 # Add a dot at rest whenever another add_every seconds of
                 # simulated time have passed (same place in every world
                 # with --cutoff compare, which shares one seed).
-                if args.add_every and dots_due(frame) > dots_due(frame - 1):
+                if args.add_every and due(frame, args.add_every):
                     for k in range(len(worlds)):
                         worlds[k] = np.vstack([worlds[k],
                                                scatter(rngs[k], 1)])
                         momenta[k] = np.vstack([momenta[k], np.zeros((1, 2))])
+                # Remove a dot chosen at random every remove_every seconds,
+                # and once every world is empty, stop recording one
+                # interval later.
+                if args.remove_every and due(frame, args.remove_every):
+                    for k in range(len(worlds)):
+                        if len(worlds[k]):
+                            gone = rngs[k].integers(len(worlds[k]))
+                            worlds[k] = np.delete(worlds[k], gone, axis=0)
+                            momenta[k] = np.delete(momenta[k], gone, axis=0)
+                    if end_frame is None and not any(map(len, worlds)):
+                        end_frame = frame + round(args.remove_every * FPS)
 
             screen.fill(BACKGROUND if args.tile is not None else DIVIDER_COLOUR)
             for k, corner in enumerate(corners):
@@ -630,9 +668,13 @@ def main():
                 recorder.write(screen)
                 frames_written += 1
                 if frames_written % (10 * FPS) == 0:
-                    print(f"  {frames_written / FPS:g} of {args.seconds:g} s",
-                          flush=True)
-                running = frames_written < total_frames
+                    of = f" of {args.seconds:g}" if total_frames else ""
+                    print(f"  {frames_written / FPS:g}{of} s, "
+                          f"{len(worlds[0])} dots", flush=True)
+                if args.remove_every:
+                    running = end_frame is None or frame < end_frame
+                else:
+                    running = frames_written < total_frames
                 continue
 
             status = (f"{dynamics}   attraction {attraction:.2f}"
