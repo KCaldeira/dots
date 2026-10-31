@@ -30,9 +30,22 @@ yellow at V_MAX.  Each dot leaves a fading trail: every frame, the previous
 picture is multiplied by the factor TRAIL_KEEP, so a mark fades
 exponentially to black (TRAIL_KEEP = 0 means no trails).
 
+The window is split into 1, 2 (side by side) or 4 (2 x 2) panels, each a
+separate world sized to fill its share, with DOT_DENSITY dots per pixel of
+area.  All start from the same random scatter; the first panel exactly,
+the others with every dot nudged by about PERTURB pixels, to show how small
+differences grow.
+
+Usage:
+    python dots.py                       fullscreen, 4 panels
+    python dots.py --panels 1            fullscreen, one world
+    python dots.py --size 1600x900 -p 2  1600 x 900 window, 2 panels
+    python dots.py --seed 3 --density 2  repeatable start, twice as many dots
+    python dots.py --display 1           on the second monitor
+
 Keys:
     space   pause / resume
-    r       re-scatter the dots
+    r       re-scatter the dots (all panels)
     a / z   increase / decrease attraction
     s / x   increase / decrease repulsion
     m       switch between acceleration and velocity dynamics (this
@@ -41,12 +54,19 @@ Keys:
     esc     quit
 """
 
+import argparse
+
 import numpy as np
 import pygame
 from scipy.spatial import cKDTree
 
-WIDTH, HEIGHT = 1920, 1080
-N_DOTS = 500
+# Each world is shown in one panel; the panels fill the window (see Usage
+# above), and each panel's size is stored here at startup.  The number of
+# dots in a world is set by DOT_DENSITY (500 dots on 1920 x 1080).
+WIDTH, HEIGHT = 960, 540
+DOT_DENSITY = 500 / (1920 * 1080)
+LAYOUTS = {1: (1, 1), 2: (2, 1), 4: (2, 2)}  # panels -> (columns, rows)
+PERTURB = 0.1                # nudge to starting positions in panels 2 on
 DOT_RADIUS = 3
 
 DYNAMICS = "acceleration"    # or "velocity"
@@ -77,10 +97,25 @@ SPEED_COLOURS = np.array([(60, 90, 255),     # blue
                           (235, 60, 50),     # red
                           (255, 230, 60)])   # yellow
 TEXT_COLOUR = (160, 160, 170)
+DIVIDER = 2                  # width of the lines between panels (pixels)
+DIVIDER_COLOUR = (60, 60, 70)
+
+
+def n_dots():
+    """Number of dots in one world, from its area."""
+    return round(DOT_DENSITY * WIDTH * HEIGHT)
+
+
+def positive(text):
+    """Parse a number greater than zero."""
+    value = float(text)
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"must be greater than 0, got {text}")
+    return value
 
 
 def scatter(rng, n):
-    """Random positions spread over the whole window."""
+    """Random positions spread over the whole world."""
     return rng.random((n, 2)) * np.array([WIDTH, HEIGHT])
 
 
@@ -129,17 +164,31 @@ def speed_colours(p):
                      for c in range(3)], axis=1).astype(int)
 
 
+_fade_scratch = {}
+
+
 def fade(surface, keep):
     """Multiply every pixel of a 32-bit surface by keep, in place."""
     # Work on whole 32-bit pixels: the 1st and 3rd colour bytes together,
     # then the 2nd, each with room above it for the multiplication.  This
-    # is several times faster than handling the channels separately.
-    # Rounding down means faint trails always reach 0 instead of sticking.
+    # is several times faster than handling the channels separately, and
+    # doing it in place with one reused scratch array avoids allocating
+    # large temporaries every frame.  Rounding down means faint trails
+    # always reach 0 instead of sticking.
     a = np.uint32(min(255, round(keep * 256)))
     px = pygame.surfarray.pixels2d(surface)    # locks surface until deleted
-    outer = (((px & 0xFF00FF) * a) >> 8) & 0xFF00FF
-    middle = (((px & 0x00FF00) * a) >> 8) & 0x00FF00
-    px[:] = outer | middle
+    middle = _fade_scratch.get(px.shape)
+    if middle is None:
+        middle = _fade_scratch[px.shape] = np.empty_like(px)
+    np.bitwise_and(px, 0x00FF00, out=middle)
+    middle *= a
+    middle >>= 8
+    middle &= 0x00FF00
+    px &= 0xFF00FF
+    px *= a
+    px >>= 8
+    px &= 0xFF00FF
+    px |= middle
     del px
 
 
@@ -159,24 +208,75 @@ def step(pos, p, dynamics, attraction, repulsion):
     return pos, p
 
 
+def start(rng, n_worlds):
+    """Starting positions for each world: one scatter, slightly nudged."""
+    base = scatter(rng, n_dots())
+    size = np.array([WIDTH, HEIGHT])
+    return [base.copy()] + [(base + rng.normal(0, PERTURB, base.shape)) % size
+                            for _ in range(n_worlds - 1)]
+
+
+def window_size(text):
+    """Parse a size such as 1600x900."""
+    try:
+        w, h = (int(v) for v in text.lower().split("x"))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected WIDTHxHEIGHT, got {text!r}")
+    return w, h
+
+
 def main():
+    global WIDTH, HEIGHT, DOT_DENSITY
+    parser = argparse.ArgumentParser(description="Dots that attract and repel.")
+    parser.add_argument("-s", "--size", type=window_size, metavar="WxH",
+                        help="window size, e.g. 1600x900 (default: fullscreen)")
+    parser.add_argument("-p", "--panels", type=int, choices=sorted(LAYOUTS),
+                        default=4, help="number of worlds side by side "
+                        "(2 splits the window left and right; default 4)")
+    parser.add_argument("--seed", type=int, help="random seed for the "
+                        "starting scatter, to repeat a run (default: random)")
+    parser.add_argument("--density", type=positive, default=1.0,
+                        help="dot density as a multiple of 500 dots per "
+                        "1920 x 1080 (default 1)")
+    parser.add_argument("-d", "--display", type=int, default=0,
+                        help="which monitor to use, counting from 0 "
+                        "(default 0)")
+    args = parser.parse_args()
+    cols, rows = LAYOUTS[args.panels]
+
     pygame.init()
-    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    monitors = pygame.display.get_desktop_sizes()
+    if not 0 <= args.display < len(monitors):
+        parser.error(f"--display must be 0 to {len(monitors) - 1}; monitors: "
+                     + ", ".join(f"{k}: {w}x{h}"
+                                 for k, (w, h) in enumerate(monitors)))
+    if args.size:
+        screen = pygame.display.set_mode(args.size, display=args.display)
+    else:
+        screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN,
+                                         display=args.display)
+    screen_w, screen_h = screen.get_size()
+    WIDTH = (screen_w - (cols - 1) * DIVIDER) // cols
+    HEIGHT = (screen_h - (rows - 1) * DIVIDER) // rows
+    DOT_DENSITY *= args.density
+    corners = [(c * (WIDTH + DIVIDER), r * (HEIGHT + DIVIDER))
+               for r in range(rows) for c in range(cols)]
     pygame.display.set_caption("dots")
     clock = pygame.time.Clock()
     font = pygame.font.SysFont(None, 22)
 
-    rng = np.random.default_rng()
-    pos = scatter(rng, N_DOTS)
-    p = np.zeros_like(pos)
+    rng = np.random.default_rng(args.seed)
+    worlds = start(rng, len(corners))
+    momenta = [np.zeros_like(pos) for pos in worlds]
     dynamics = DYNAMICS
     attraction, repulsion = ATTRACTION[dynamics], REPULSION[dynamics]
     trail_keep = TRAIL_KEEP
     paused = False
 
-    # Picture of the dots so far, faded a little each frame.
-    trails = pygame.Surface((WIDTH, HEIGHT), depth=32)
-    trails.fill(BACKGROUND)
+    # Picture of each world's dots so far, faded a little each frame.
+    trails = [pygame.Surface((WIDTH, HEIGHT), depth=32) for _ in worlds]
+    for surface in trails:
+        surface.fill(BACKGROUND)
 
     running = True
     while running:
@@ -189,9 +289,10 @@ def main():
                 elif event.key == pygame.K_SPACE:
                     paused = not paused
                 elif event.key == pygame.K_r:
-                    pos = scatter(rng, N_DOTS)
-                    p = np.zeros_like(pos)
-                    trails.fill(BACKGROUND)
+                    worlds = start(rng, len(corners))
+                    momenta = [np.zeros_like(pos) for pos in worlds]
+                    for surface in trails:
+                        surface.fill(BACKGROUND)
                 elif event.key == pygame.K_m:
                     dynamics = ("velocity" if dynamics == "acceleration"
                                 else "acceleration")
@@ -211,16 +312,20 @@ def main():
                 elif event.key == pygame.K_g:
                     trail_keep = max(0.0, 1 - (1 - trail_keep) * 2)
 
-        if not paused:
-            pos, p = step(pos, p, dynamics, attraction, repulsion)
-            fade(trails, trail_keep)
-
-        for (x, y), colour in zip(pos, speed_colours(p)):
-            pygame.draw.circle(trails, colour, (int(x), int(y)), DOT_RADIUS)
-        screen.blit(trails, (0, 0))
+        screen.fill(DIVIDER_COLOUR)
+        for k, corner in enumerate(corners):
+            if not paused:
+                worlds[k], momenta[k] = step(worlds[k], momenta[k], dynamics,
+                                             attraction, repulsion)
+                fade(trails[k], trail_keep)
+            for (x, y), colour in zip(worlds[k], speed_colours(momenta[k])):
+                pygame.draw.circle(trails[k], colour, (int(x), int(y)),
+                                   DOT_RADIUS)
+            screen.blit(trails[k], corner)
 
         status = (f"{dynamics}   attraction {attraction:.2f}"
                   f"   repulsion {repulsion:.2f}   trail {trail_keep:.3f}"
+                  f"   {n_dots()} dots per panel"
                   f"{'   [paused]' if paused else ''}")
         screen.blit(font.render(status, True, TEXT_COLOUR), (10, 10))
         pygame.display.flip()
