@@ -52,6 +52,11 @@ random numbers from seed + k, so the panels differ only in their random
 starting velocities (and scatter, with --start random).  The status line
 shows the seed, so a run can be repeated with --seed.
 
+With --start empty the world starts with no dots, and --add-every S adds
+one dot at rest at a random place every S seconds (of simulated time, at
+FPS frames per second, so videos and live runs match).  --add-every works
+with the other starts too.
+
 Usage:
     python dots.py                       fullscreen, one world
     python dots.py --panels 4            fullscreen, 4 panels
@@ -59,6 +64,9 @@ Usage:
     python dots.py --seed 3 --density 2  repeatable start, twice as many dots
     python dots.py --vrms 1.5            hotter start
     python dots.py --start random        random scatter instead of a grid
+    python dots.py --start empty --add-every 0.1
+                                         start with no dots and add one at
+                                         rest every 0.1 s
     python dots.py --display 0           on the first monitor (default: the
                                          second, if there is one)
     python dots.py --cutoff on           ignore pairs farther than R_CUT
@@ -198,6 +206,9 @@ def interactions(pos, attraction, repulsion):
     """Summed interaction on every dot, from its distances to the others."""
     # Find the pairs closer than R_CUT with a k-d tree on the torus, so only
     # those pairs are computed (all pairs would be far slower).
+    n = len(pos)
+    if n < 2:
+        return np.zeros((n, 2))
     size = np.array([WIDTH, HEIGHT])
     pos = pos % size
     pos[pos >= size] = 0.0               # float rounding can give exactly size
@@ -216,7 +227,6 @@ def interactions(pos, attraction, repulsion):
     pull = (f / r)[:, np.newaxis] * d
 
     # Each pair pulls i towards j and j towards i, equally and oppositely.
-    n = len(pos)
     return np.stack([np.bincount(i, pull[:, c], n)
                      - np.bincount(j, pull[:, c], n) for c in range(2)], axis=1)
 
@@ -336,16 +346,23 @@ def start(seed, n_worlds, layout, vrms, same=False):
     """Starting positions and internal velocities for each world.
 
     World k draws its random numbers from seed + k, or from seed for every
-    world if same is true.
+    world if same is true.  Each world's random number generator is
+    returned too, for placing dots added later.
     """
-    worlds, momenta = [], []
+    worlds, momenta, rngs = [], [], []
     for k in range(n_worlds):
         rng = np.random.default_rng(seed if same else seed + k)
-        pos = hex_grid() if layout == "hex" else scatter(rng, n_dots())
+        if layout == "hex":
+            pos = hex_grid()
+        elif layout == "random":
+            pos = scatter(rng, n_dots())
+        else:
+            pos = np.zeros((0, 2))
         worlds.append(pos)
-        momenta.append(random_momenta(rng, len(pos), vrms) if vrms > 0
-                       else np.zeros_like(pos))
-    return worlds, momenta
+        momenta.append(random_momenta(rng, len(pos), vrms)
+                       if vrms > 0 and len(pos) > 0 else np.zeros_like(pos))
+        rngs.append(rng)
+    return worlds, momenta, rngs
 
 
 def new_seed():
@@ -413,9 +430,12 @@ def main():
     parser.add_argument("--density", type=positive, default=1.0,
                         help="dot density as a multiple of 500 dots per "
                         "1920 x 1080 (default 1)")
-    parser.add_argument("--start", choices=["hex", "random"], default="hex",
-                        help="starting layout: a hexagonal grid, or a random "
-                        "scatter (default hex)")
+    parser.add_argument("--start", choices=["hex", "random", "empty"],
+                        default="hex", help="starting layout: a hexagonal "
+                        "grid, a random scatter, or no dots (default hex)")
+    parser.add_argument("--add-every", type=positive, metavar="S",
+                        help="add one dot at rest at a random place every S "
+                        "seconds, e.g. 0.1 (default: never)")
     parser.add_argument("--vrms", type=non_negative, default=0.5,
                         help="rms starting velocity in pixels per frame "
                         "(default 0.5).  With --cutoff on and the default "
@@ -498,7 +518,15 @@ def main():
 
     seed = new_seed() if args.seed is None else args.seed
     same = args.cutoff == "compare"
-    worlds, momenta = start(seed, len(corners), args.start, args.vrms, same)
+    worlds, momenta, rngs = start(seed, len(corners), args.start, args.vrms,
+                                  same)
+    frame = 0            # frames simulated since the (re)start
+
+    def dots_due(frames):
+        """Dots to have been added after this many frames (--add-every)."""
+        # The small allowance stops float rounding (0.1 * 60 is just over
+        # 6) from delaying each dot by a frame.
+        return int(frames / (args.add_every * FPS) + 1e-9)
     if args.cutoff == "compare":
         cutoffs = [True, False]
         labels = [f"{R_CUT:g} px cutoff", "no cutoff"]
@@ -517,6 +545,8 @@ def main():
                     f"{f'tile {args.tile:g}, ' if args.tile else ''}"
                     f"cutoff {args.cutoff}, start {args.start}, "
                     f"vrms {args.vrms}, "
+                    + (f"add every {args.add_every:g} s, "
+                       if args.add_every else "") +
                     f"density {args.density}, seed {seed}")
         recorder = Recorder(args.record, screen.get_size(), settings)
         print(f"Recording {args.seconds:g} s ({total_frames} frames) at "
@@ -541,8 +571,10 @@ def main():
                         paused = not paused
                     elif event.key == pygame.K_r:
                         seed = new_seed()
-                        worlds, momenta = start(seed, len(corners),
-                                                args.start, args.vrms, same)
+                        worlds, momenta, rngs = start(seed, len(corners),
+                                                      args.start, args.vrms,
+                                                      same)
+                        frame = 0
                         for surface in trails:
                             surface.fill(BACKGROUND)
                     elif event.key == pygame.K_m:
@@ -563,6 +595,17 @@ def main():
                         trail_keep = 1 - (1 - trail_keep) / 2
                     elif event.key == pygame.K_g:
                         trail_keep = max(0.0, 1 - (1 - trail_keep) * 2)
+
+            if not paused:
+                frame += 1
+                # Add a dot at rest whenever another add_every seconds of
+                # simulated time have passed (same place in every world
+                # with --cutoff compare, which shares one seed).
+                if args.add_every and dots_due(frame) > dots_due(frame - 1):
+                    for k in range(len(worlds)):
+                        worlds[k] = np.vstack([worlds[k],
+                                               scatter(rngs[k], 1)])
+                        momenta[k] = np.vstack([momenta[k], np.zeros((1, 2))])
 
             screen.fill(BACKGROUND if args.tile is not None else DIVIDER_COLOUR)
             for k, corner in enumerate(corners):

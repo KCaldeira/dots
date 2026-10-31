@@ -41,7 +41,8 @@ so a run you like can be repeated with `--seed`.
 | `--vrms V` | rms starting velocity, px/frame (default 0.5). With `--cutoff on`, about 1.25 or less gives clumps in a gas; 1.5 or more stays a gas |
 | `--cutoff {off,on,compare}` | `off` (default): every pair interacts. `on`: dots more than 120 px apart ignore each other (faster). `compare`: two panels with identical starts, cutoff on the left and none on the right |
 | `--tile [F]` | one world in the centre of the window, a fraction `F` of its width and height (default 0.5), surrounded by copies of itself, so you can watch dots wrap around the torus. One panel only |
-| `--start {hex,random}` | starting layout: hexagonal grid (default) or random scatter |
+| `--start {hex,random,empty}` | starting layout: hexagonal grid (default), random scatter, or no dots |
+| `--add-every S` | add one dot at rest at a random place every `S` seconds of simulated time (60 frames per second), e.g. `0.1` |
 | `--seed N` | random seed for panel 1; panel *k* uses seed + *k* (default: random, shown in the status line) |
 | `--density X` | dot density as a multiple of 500 dots per 1920 × 1080 (default 1) |
 | `-d`, `--display N` | which monitor to use, counting from 0 (default 1, or 0 if there is only one) |
@@ -67,6 +68,10 @@ python dots.py --cutoff compare --seed 7
 # itself: clumps and trails can be followed across the wrapped edges.
 python dots.py --tile --seed 3          # world is half the width and height
 python dots.py --tile 0.75 --seed 3     # larger world, narrower border
+
+# Start empty and add a dot at rest every 0.1 s: 600 dots after a minute.
+# Without the cutoff they gather into one big hot clump in a gas.
+python dots.py --start empty --add-every 0.1 --seed 3
 
 # Compare starting temperatures (thresholds measured this way: four
 # panels, cutoff on).
