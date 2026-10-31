@@ -13,6 +13,14 @@ f is zero at r = R0 * sqrt(REPULSION / ATTRACTION), the preferred spacing
 for a single pair.
 The world wraps around at the edges (a torus).
 
+With --charges, half the dots are positive and half negative (q = +1 or
+-1), and the 1/r^2 term depends on the pair's charges:
+
+    f(r) = -q_i * q_j * ATTRACTION * (R0 / r)**2 - REPULSION * (R0 / r)**4
+
+Opposite charges attract as above; like charges repel through both terms.
+Positive dots are drawn in warm colours and negative in cool ones.
+
 By default every pair interacts, through the nearest copy of the other dot
 around the wrapped edges (so in effect the range is cut off at half the
 world's width and height).  Every pair costs time, so this uses a compiled
@@ -70,6 +78,7 @@ Usage:
     python dots.py --start empty --add-every 0.1
                                          start with no dots and add one at
                                          rest every 0.1 s
+    python dots.py --charges             positive and negative dots
     python dots.py --remove-every 0.1 --seconds 300
                                          start with about 3000 dots on the
                                          grid and remove one every 0.1 s
@@ -145,6 +154,15 @@ SPEED_COLOURS = np.array([(60, 90, 255),     # blue
                           (150, 60, 220),    # purple
                           (235, 60, 50),     # red
                           (255, 230, 60)])   # yellow
+# With --charges, separate scales for each kind, from still to V_MAX:
+# dark red to yellow for positive, dark blue to cyan for negative.
+CHARGE_STOPS = [0.0, 0.5, 1.0]
+CHARGE_COLOURS = {+1: np.array([(110, 25, 20),      # dark red
+                                (235, 60, 50),      # red
+                                (255, 230, 60)]),   # yellow
+                  -1: np.array([(25, 35, 130),      # dark blue
+                                (60, 90, 255),      # blue
+                                (120, 235, 255)])}  # cyan
 TEXT_COLOUR = (160, 160, 170)
 DIVIDER = 2                  # width of the lines between panels (pixels)
 DIVIDER_COLOUR = (60, 60, 70)
@@ -208,8 +226,12 @@ def scatter(rng, n):
     return rng.random((n, 2)) * np.array([WIDTH, HEIGHT])
 
 
-def interactions(pos, attraction, repulsion):
-    """Summed interaction on every dot, from its distances to the others."""
+def interactions(pos, attraction, repulsion, q=None):
+    """Summed interaction on every dot, from its distances to the others.
+
+    With charges q (+1 or -1 per dot), like charges repel and opposite
+    charges attract through the 1/r^2 term.
+    """
     # Find the pairs closer than R_CUT with a k-d tree on the torus, so only
     # those pairs are computed (all pairs would be far slower).
     n = len(pos)
@@ -229,6 +251,8 @@ def interactions(pos, attraction, repulsion):
     r = np.hypot(d[:, 0], d[:, 1])
     r = np.maximum(r, 1.0)               # avoid blow-up when dots overlap
 
+    if q is not None:
+        attraction = -attraction * q[i] * q[j]
     f = attraction * (R0 / r) ** 2 - repulsion * (R0 / r) ** 4
     pull = (f / r)[:, np.newaxis] * d
 
@@ -265,12 +289,23 @@ def speed_limit(v):
     return v * scale[:, np.newaxis]
 
 
-def speed_colours(p):
-    """RGB colour for each dot, from its speed as a fraction of V_MAX."""
+def speed_colours(p, q=None):
+    """RGB colour for each dot, from its speed as a fraction of V_MAX.
+
+    With charges q, positive and negative dots use separate colour scales.
+    """
     v = speed_limit(p)
     fraction = np.hypot(v[:, 0], v[:, 1]) / V_MAX
-    return np.stack([np.interp(fraction, SPEED_STOPS, SPEED_COLOURS[:, c])
-                     for c in range(3)], axis=1).astype(int)
+    if q is None:
+        return np.stack([np.interp(fraction, SPEED_STOPS, SPEED_COLOURS[:, c])
+                         for c in range(3)], axis=1).astype(int)
+    colours = np.empty((len(p), 3))
+    for sign, scale in CHARGE_COLOURS.items():
+        kind = q == sign
+        for c in range(3):
+            colours[kind, c] = np.interp(fraction[kind], CHARGE_STOPS,
+                                         scale[:, c])
+    return colours.astype(int)
 
 
 _fade_scratch = {}
@@ -302,7 +337,7 @@ def fade(surface, keep):
 
 
 @numba.njit(cache=True)
-def _all_pairs(pos, attraction, repulsion, r0, width, height):
+def _all_pairs(pos, attraction, repulsion, r0, width, height, q, charged):
     """Summed interaction on every dot from every other dot (no cutoff)."""
     # A plain double loop over each pair once, compiled by numba: about 16
     # times faster than doing all pairs with numpy arrays, which builds
@@ -316,8 +351,9 @@ def _all_pairs(pos, attraction, repulsion, r0, width, height):
             dx -= width * np.round(dx / width)       # nearest periodic image
             dy -= height * np.round(dy / height)
             r = max(np.sqrt(dx * dx + dy * dy), 1.0)
-            q = (r0 / r) ** 2
-            pull = (attraction * q - repulsion * q * q) / r
+            a = -attraction * q[i] * q[j] if charged else attraction
+            s = (r0 / r) ** 2
+            pull = (a * s - repulsion * s * s) / r
             total[i, 0] += pull * dx
             total[i, 1] += pull * dy
             total[j, 0] -= pull * dx
@@ -325,37 +361,45 @@ def _all_pairs(pos, attraction, repulsion, r0, width, height):
     return total
 
 
-def all_pair_interactions(pos, attraction, repulsion):
+def all_pair_interactions(pos, attraction, repulsion, q=None):
     """Like interactions(), but every pair interacts: no R_CUT."""
+    charged = q is not None
+    if not charged:
+        q = np.ones(len(pos))                # unused
     return _all_pairs(pos, attraction, repulsion, R0, float(WIDTH),
-                      float(HEIGHT))
+                      float(HEIGHT), q, charged)
 
 
-def step(pos, p, dynamics, attraction, repulsion, cutoff=True):
-    """Advance positions (and internal velocities p) by one frame."""
+def step(pos, p, dynamics, attraction, repulsion, cutoff=True, q=None):
+    """Advance positions (and internal velocities p) by one frame.
+
+    q holds each dot's charge with --charges, otherwise None.
+    """
     forces = interactions if cutoff else all_pair_interactions
     size = np.array([WIDTH, HEIGHT])
     if dynamics == "velocity":
-        p = forces(pos, attraction, repulsion)
+        p = forces(pos, attraction, repulsion, q)
         pos = (pos + speed_limit(p)) % size
     else:
         dt = 1.0 / SUBSTEPS
         for _ in range(SUBSTEPS):
             # Kick then drift (semi-implicit Euler), which keeps the
             # frictionless system's energy from drifting.
-            p = p + dt * forces(pos, attraction, repulsion)
+            p = p + dt * forces(pos, attraction, repulsion, q)
             pos = (pos + dt * speed_limit(p)) % size
     return pos, p
 
 
-def start(seed, n_worlds, layout, vrms, same=False):
-    """Starting positions and internal velocities for each world.
+def start(seed, n_worlds, layout, vrms, same=False, charged=False):
+    """Starting positions, internal velocities and charges for each world.
 
     World k draws its random numbers from seed + k, or from seed for every
     world if same is true.  Each world's random number generator is
-    returned too, for placing dots added later.
+    returned too, for placing dots added later.  With charged, half the
+    dots (chosen at random) are positive and half negative; otherwise the
+    charges are None.
     """
-    worlds, momenta, rngs = [], [], []
+    worlds, momenta, rngs, charges = [], [], [], []
     for k in range(n_worlds):
         rng = np.random.default_rng(seed if same else seed + k)
         if layout == "hex":
@@ -367,8 +411,11 @@ def start(seed, n_worlds, layout, vrms, same=False):
         worlds.append(pos)
         momenta.append(random_momenta(rng, len(pos), vrms)
                        if vrms > 0 and len(pos) > 0 else np.zeros_like(pos))
+        # Charges are drawn last, so uncharged runs repeat as before.
+        charges.append(rng.permutation(np.arange(len(pos)) % 2 * 2 - 1)
+                       .astype(float) if charged else None)
         rngs.append(rng)
-    return worlds, momenta, rngs
+    return worlds, momenta, rngs, charges
 
 
 def new_seed():
@@ -461,6 +508,10 @@ def main():
                         "ignore each other (faster); compare: two panels "
                         "with identical starts, cutoff on the left and none "
                         "on the right")
+    parser.add_argument("--charges", action="store_true",
+                        help="half the dots positive and half negative: like "
+                        "charges repel and opposite charges attract (the "
+                        "short-range repulsion is the same for all)")
     parser.add_argument("--tile", type=tile_fraction, nargs="?", const=0.5,
                         metavar="F", help="one world in the centre of the "
                         "window, a fraction F of its width and height "
@@ -534,8 +585,8 @@ def main():
 
     seed = new_seed() if args.seed is None else args.seed
     same = args.cutoff == "compare"
-    worlds, momenta, rngs = start(seed, len(corners), args.start, args.vrms,
-                                  same)
+    worlds, momenta, rngs, charges = start(seed, len(corners), args.start,
+                                           args.vrms, same, args.charges)
     frame = 0            # frames simulated since the (re)start
 
     end_frame = None     # with --remove-every, when to stop recording
@@ -571,6 +622,7 @@ def main():
                        if args.add_every else "")
                     + (f"remove every {args.remove_every:g} s, "
                        if args.remove_every else "") +
+                    f"{'charges, ' if args.charges else ''}"
                     f"density {args.density}, seed {seed}")
         recorder = Recorder(args.record, screen.get_size(), settings)
         length = (f"{args.seconds:g} s ({total_frames} frames)"
@@ -597,9 +649,9 @@ def main():
                         paused = not paused
                     elif event.key == pygame.K_r:
                         seed = new_seed()
-                        worlds, momenta, rngs = start(seed, len(corners),
-                                                      args.start, args.vrms,
-                                                      same)
+                        worlds, momenta, rngs, charges = start(
+                            seed, len(corners), args.start, args.vrms, same,
+                            args.charges)
                         frame = 0
                         end_frame = None
                         for surface in trails:
@@ -633,6 +685,9 @@ def main():
                         worlds[k] = np.vstack([worlds[k],
                                                scatter(rngs[k], 1)])
                         momenta[k] = np.vstack([momenta[k], np.zeros((1, 2))])
+                        if args.charges:          # either kind, at random
+                            charges[k] = np.append(
+                                charges[k], rngs[k].choice([-1.0, 1.0]))
                 # Remove a dot chosen at random every remove_every seconds,
                 # and once every world is empty, stop recording one
                 # interval later.
@@ -642,6 +697,8 @@ def main():
                             gone = rngs[k].integers(len(worlds[k]))
                             worlds[k] = np.delete(worlds[k], gone, axis=0)
                             momenta[k] = np.delete(momenta[k], gone, axis=0)
+                            if args.charges:
+                                charges[k] = np.delete(charges[k], gone)
                     if end_frame is None and not any(map(len, worlds)):
                         end_frame = frame + round(args.remove_every * FPS)
 
@@ -650,9 +707,11 @@ def main():
                 if not paused:
                     worlds[k], momenta[k] = step(worlds[k], momenta[k],
                                                  dynamics, attraction,
-                                                 repulsion, cutoffs[k])
+                                                 repulsion, cutoffs[k],
+                                                 charges[k])
                     fade(trails[k], trail_keep)
-                draw_dots(trails[k], worlds[k], speed_colours(momenta[k]))
+                draw_dots(trails[k], worlds[k],
+                          speed_colours(momenta[k], charges[k]))
                 for dx, dy in copies:
                     screen.blit(trails[k], (corner[0] + dx, corner[1] + dy))
             if args.tile is not None:
@@ -679,7 +738,8 @@ def main():
 
             status = (f"{dynamics}   attraction {attraction:.2f}"
                       f"   repulsion {repulsion:.2f}   trail {trail_keep:.3f}"
-                      f"   {len(worlds[0])} dots per panel   seed {seed}"
+                      f"   {len(worlds[0])} dots per panel"
+                      f"{'   charges' if args.charges else ''}   seed {seed}"
                       f"{'   [paused]' if paused else ''}")
             screen.blit(font.render(status, True, TEXT_COLOUR), (10, 10))
             pygame.display.flip()

@@ -40,6 +40,7 @@ so a run you like can be repeated with `--seed`.
 | `-p`, `--panels {1,2,4}` | number of worlds: 1, 2 (side by side) or 4 (2 × 2); default 1 |
 | `--vrms V` | rms starting velocity, px/frame (default 0.5). With `--cutoff on`, about 1.25 or less gives clumps in a gas; 1.5 or more stays a gas |
 | `--cutoff {off,on,compare}` | `off` (default): every pair interacts. `on`: dots more than 120 px apart ignore each other (faster). `compare`: two panels with identical starts, cutoff on the left and none on the right |
+| `--charges` | half the dots positive (drawn dark red → yellow with speed), half negative (dark blue → cyan): like charges repel and opposite charges attract through the 1/r² term; the 1/r⁴ repulsion is the same for all |
 | `--tile [F]` | one world in the centre of the window, a fraction `F` of its width and height (default 0.5), surrounded by copies of itself, so you can watch dots wrap around the torus. One panel only |
 | `--start {hex,random,empty}` | starting layout: hexagonal grid (default), random scatter, or no dots |
 | `--remove-every S` | remove one dot chosen at random every `S` seconds. With `--seconds`, start with about seconds ÷ `S` dots (this sets the density), and end a recording `S` seconds after the last dot has gone |
@@ -69,6 +70,10 @@ python dots.py --cutoff compare --seed 7
 # itself: clumps and trails can be followed across the wrapped edges.
 python dots.py --tile --seed 3          # world is half the width and height
 python dots.py --tile 0.75 --seed 3     # larger world, narrower border
+
+# Positive and negative dots: opposite kinds attract, like kinds repel.
+python dots.py --charges --seed 5
+python dots.py --charges --cutoff compare --seed 5
 
 # Start empty and add a dot at rest every 0.1 s: 600 dots after a minute.
 # Without the cutoff they gather into one big hot clump in a gas.
