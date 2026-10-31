@@ -6,3 +6,7 @@ scipy
 pygame
 # Quick plots and saving animations to MP4/GIF
 matplotlib
+# Video recording (--record): a bundled ffmpeg, used if none is installed
+imageio-ffmpeg
+# Compiled all-pairs forces (--cutoff off / compare)
+numba

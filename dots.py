@@ -3,8 +3,7 @@
 For a pair of dots at distance r, the interaction along the line joining
 them is
 
-    f(r) = ATTRACTION * (R0 / r)**2 - REPULSION * (R0 / r)**4   for r < R_CUT
-    f(r) = 0                                                    otherwise
+    f(r) = ATTRACTION * (R0 / r)**2 - REPULSION * (R0 / r)**4
 
 Attraction falls off as 1/r^2 and repulsion as 1/r^4, so repulsion wins
 at short range and attraction at long range.
@@ -13,6 +12,14 @@ Positive f pulls a dot towards its neighbour; negative f pushes it away.
 f is zero at r = R0 * sqrt(REPULSION / ATTRACTION), the preferred spacing
 for a single pair.
 The world wraps around at the edges (a torus).
+
+By default every pair interacts, through the nearest copy of the other dot
+around the wrapped edges (so in effect the range is cut off at half the
+world's width and height).  Every pair costs time, so this uses a compiled
+loop (numba).  With --cutoff on, dots farther apart than R_CUT ignore each
+other (f = 0), and only nearby pairs are found and computed, which is
+faster.  --cutoff compare shows two panels with identical starts, the left
+with the cutoff and the right without.
 
 Two kinds of dynamics (press m to switch):
 
@@ -32,20 +39,39 @@ exponentially to black (TRAIL_KEEP = 0 means no trails).
 
 The window is split into 1, 2 (side by side) or 4 (2 x 2) panels, each a
 separate world sized to fill its share, with DOT_DENSITY dots per pixel of
-area.  All start from the same random scatter; the first panel exactly,
-the others with every dot nudged by about PERTURB pixels, to show how small
-differences grow.
+area.
+
+Dots start on a near-hexagonal grid (so only certain dot counts fit; the
+status line shows the actual number) with random starting velocities of a
+chosen rms (--vrms), which sets how hot the run starts.  With --start
+random they start at a random scatter instead, whose close pairs release a
+burst of energy of unpredictable size.  Panel k (counting from 0) draws its
+random numbers from seed + k, so the panels differ only in their random
+starting velocities (and scatter, with --start random).  The status line
+shows the seed, so a run can be repeated with --seed.
 
 Usage:
-    python dots.py                       fullscreen, 4 panels
-    python dots.py --panels 1            fullscreen, one world
+    python dots.py                       fullscreen, one world
+    python dots.py --panels 4            fullscreen, 4 panels
     python dots.py --size 1600x900 -p 2  1600 x 900 window, 2 panels
     python dots.py --seed 3 --density 2  repeatable start, twice as many dots
-    python dots.py --display 1           on the second monitor
+    python dots.py --vrms 1.5            hotter start
+    python dots.py --start random        random scatter instead of a grid
+    python dots.py --display 0           on the first monitor (default: the
+                                         second, if there is one)
+    python dots.py --cutoff on           ignore pairs farther than R_CUT
+    python dots.py --cutoff compare      cutoff (left) vs none (right)
+    python dots.py --record dots.mp4     write a 60 s 1920 x 1080 video for
+                                         YouTube instead of showing a window
+                                         (--seconds and --size change it)
+
+Recording needs ffmpeg: the system's, or the copy in the imageio-ffmpeg
+package (in requirements.txt).  It runs without a window, as fast as the
+computer allows, and Ctrl-C stops early with a valid, shorter video.
 
 Keys:
     space   pause / resume
-    r       re-scatter the dots (all panels)
+    r       restart all panels with a new random seed
     a / z   increase / decrease attraction
     s / x   increase / decrease repulsion
     m       switch between acceleration and velocity dynamics (this
@@ -55,8 +81,12 @@ Keys:
 """
 
 import argparse
+import os
+import shutil
+import subprocess
 
 import numpy as np
+import numba
 import pygame
 from scipy.spatial import cKDTree
 
@@ -66,7 +96,6 @@ from scipy.spatial import cKDTree
 WIDTH, HEIGHT = 960, 540
 DOT_DENSITY = 500 / (1920 * 1080)
 LAYOUTS = {1: (1, 1), 2: (2, 1), 4: (2, 2)}  # panels -> (columns, rows)
-PERTURB = 0.1                # nudge to starting positions in panels 2 on
 DOT_RADIUS = 3
 
 DYNAMICS = "acceleration"    # or "velocity"
@@ -106,11 +135,41 @@ def n_dots():
     return round(DOT_DENSITY * WIDTH * HEIGHT)
 
 
+def hex_grid():
+    """Near-hexagonal grid of dots filling the world at about DOT_DENSITY."""
+    # Spacing of a perfect hexagonal grid at this density, then whole
+    # numbers of columns and rows (an even number of rows, so the offset
+    # rows join up across the wrapped top and bottom edges).
+    spacing = np.sqrt(2 / (np.sqrt(3) * DOT_DENSITY))
+    cols = max(1, round(WIDTH / spacing))
+    rows = max(2, 2 * round(HEIGHT / (spacing * np.sqrt(3) / 2) / 2))
+    col, row = np.meshgrid(np.arange(cols), np.arange(rows))
+    x = (col + 0.5 * (row % 2)) * WIDTH / cols
+    y = (row + 0.5) * HEIGHT / rows
+    return np.stack([x.ravel(), y.ravel()], axis=1)
+
+
+def random_momenta(rng, n, vrms):
+    """Normally distributed internal velocities with the given rms."""
+    p = rng.normal(0, 1, (n, 2))
+    p -= p.mean(axis=0)                  # no overall drift of the world
+    rms = np.sqrt(np.mean(np.sum(p ** 2, axis=1)))
+    return p * (vrms / rms) if rms > 0 else np.zeros((n, 2))
+
+
 def positive(text):
     """Parse a number greater than zero."""
     value = float(text)
     if value <= 0:
         raise argparse.ArgumentTypeError(f"must be greater than 0, got {text}")
+    return value
+
+
+def non_negative(text):
+    """Parse a number of zero or more."""
+    value = float(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"must be 0 or more, got {text}")
     return value
 
 
@@ -192,28 +251,109 @@ def fade(surface, keep):
     del px
 
 
-def step(pos, p, dynamics, attraction, repulsion):
+@numba.njit(cache=True)
+def _all_pairs(pos, attraction, repulsion, r0, width, height):
+    """Summed interaction on every dot from every other dot (no cutoff)."""
+    # A plain double loop over each pair once, compiled by numba: about 16
+    # times faster than doing all pairs with numpy arrays, which builds
+    # large temporary arrays.
+    n = pos.shape[0]
+    total = np.zeros((n, 2))
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = pos[j, 0] - pos[i, 0]
+            dy = pos[j, 1] - pos[i, 1]
+            dx -= width * np.round(dx / width)       # nearest periodic image
+            dy -= height * np.round(dy / height)
+            r = max(np.sqrt(dx * dx + dy * dy), 1.0)
+            q = (r0 / r) ** 2
+            pull = (attraction * q - repulsion * q * q) / r
+            total[i, 0] += pull * dx
+            total[i, 1] += pull * dy
+            total[j, 0] -= pull * dx
+            total[j, 1] -= pull * dy
+    return total
+
+
+def all_pair_interactions(pos, attraction, repulsion):
+    """Like interactions(), but every pair interacts: no R_CUT."""
+    return _all_pairs(pos, attraction, repulsion, R0, float(WIDTH),
+                      float(HEIGHT))
+
+
+def step(pos, p, dynamics, attraction, repulsion, cutoff=True):
     """Advance positions (and internal velocities p) by one frame."""
+    forces = interactions if cutoff else all_pair_interactions
     size = np.array([WIDTH, HEIGHT])
     if dynamics == "velocity":
-        p = interactions(pos, attraction, repulsion)
+        p = forces(pos, attraction, repulsion)
         pos = (pos + speed_limit(p)) % size
     else:
         dt = 1.0 / SUBSTEPS
         for _ in range(SUBSTEPS):
             # Kick then drift (semi-implicit Euler), which keeps the
             # frictionless system's energy from drifting.
-            p = p + dt * interactions(pos, attraction, repulsion)
+            p = p + dt * forces(pos, attraction, repulsion)
             pos = (pos + dt * speed_limit(p)) % size
     return pos, p
 
 
-def start(rng, n_worlds):
-    """Starting positions for each world: one scatter, slightly nudged."""
-    base = scatter(rng, n_dots())
-    size = np.array([WIDTH, HEIGHT])
-    return [base.copy()] + [(base + rng.normal(0, PERTURB, base.shape)) % size
-                            for _ in range(n_worlds - 1)]
+def start(seed, n_worlds, layout, vrms, same=False):
+    """Starting positions and internal velocities for each world.
+
+    World k draws its random numbers from seed + k, or from seed for every
+    world if same is true.
+    """
+    worlds, momenta = [], []
+    for k in range(n_worlds):
+        rng = np.random.default_rng(seed if same else seed + k)
+        pos = hex_grid() if layout == "hex" else scatter(rng, n_dots())
+        worlds.append(pos)
+        momenta.append(random_momenta(rng, len(pos), vrms) if vrms > 0
+                       else np.zeros_like(pos))
+    return worlds, momenta
+
+
+def new_seed():
+    """A random seed, small enough to read off the screen and type back."""
+    return int(np.random.default_rng().integers(1_000_000))
+
+
+class Recorder:
+    """Pipe frames to ffmpeg, encoding an H.264 MP4 suitable for YouTube."""
+
+    def __init__(self, path, size, comment):
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            try:
+                import imageio_ffmpeg
+            except ImportError:
+                raise SystemExit("Recording needs ffmpeg: install it, or "
+                                 "pip install imageio-ffmpeg")
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        w, h = size
+        # YouTube's recommended settings: H.264 High profile, 4:2:0 colour,
+        # two B-frames, a keyframe every half second, and the index at the
+        # front of the file (faststart) so processing can start early.
+        self.process = subprocess.Popen(
+            [ffmpeg, "-y", "-loglevel", "error",
+             "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}",
+             "-r", str(FPS), "-i", "-",
+             "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+             "-profile:v", "high", "-pix_fmt", "yuv420p",
+             "-g", str(FPS // 2), "-bf", "2", "-movflags", "+faststart",
+             "-metadata", f"comment={comment}", path],
+            # Own session, so Ctrl-C stops only Python, which then closes
+            # the pipe and lets ffmpeg finish the file properly.
+            stdin=subprocess.PIPE, start_new_session=True)
+
+    def write(self, surface):
+        self.process.stdin.write(pygame.image.tobytes(surface, "RGB"))
+
+    def close(self):
+        self.process.stdin.close()
+        if self.process.wait() != 0:
+            raise SystemExit("ffmpeg failed; see the message above")
 
 
 def window_size(text):
@@ -231,21 +371,56 @@ def main():
     parser.add_argument("-s", "--size", type=window_size, metavar="WxH",
                         help="window size, e.g. 1600x900 (default: fullscreen)")
     parser.add_argument("-p", "--panels", type=int, choices=sorted(LAYOUTS),
-                        default=4, help="number of worlds side by side "
-                        "(2 splits the window left and right; default 4)")
+                        default=1, help="number of worlds side by side "
+                        "(2 splits the window left and right; default 1)")
     parser.add_argument("--seed", type=int, help="random seed for the "
-                        "starting scatter, to repeat a run (default: random)")
+                        "first panel; panel k uses seed + k.  Shown in the "
+                        "status line, to repeat a run (default: random)")
     parser.add_argument("--density", type=positive, default=1.0,
                         help="dot density as a multiple of 500 dots per "
                         "1920 x 1080 (default 1)")
-    parser.add_argument("-d", "--display", type=int, default=0,
+    parser.add_argument("--start", choices=["hex", "random"], default="hex",
+                        help="starting layout: a hexagonal grid, or a random "
+                        "scatter (default hex)")
+    parser.add_argument("--vrms", type=non_negative, default=0.5,
+                        help="rms starting velocity in pixels per frame "
+                        "(default 0.5).  With --cutoff on and the default "
+                        "density, about 1.25 or less gives clumps in a gas "
+                        "and 1.5 or more stays a gas.  This is the internal "
+                        "velocity p; "
+                        "visible speeds are a little lower because of the "
+                        "speed limit")
+    parser.add_argument("--cutoff", choices=["on", "off", "compare"],
+                        default="off", help="off: every pair interacts "
+                        f"(default); on: dots farther apart than {R_CUT:g} px "
+                        "ignore each other (faster); compare: two panels "
+                        "with identical starts, cutoff on the left and none "
+                        "on the right")
+    parser.add_argument("-d", "--display", type=int,
                         help="which monitor to use, counting from 0 "
-                        "(default 0)")
+                        "(default 1, or 0 if there is only one)")
+    parser.add_argument("--record", metavar="FILE",
+                        help="write an MP4 video to FILE instead of showing "
+                        "a window (default size 1920x1080)")
+    parser.add_argument("--seconds", type=positive, default=60.0,
+                        help=f"length of the video when recording, at {FPS} "
+                        "frames per second (default 60)")
     args = parser.parse_args()
+    if args.cutoff == "compare":
+        args.panels = 2
     cols, rows = LAYOUTS[args.panels]
+    if args.record:
+        args.size = args.size or (1920, 1080)
+        if args.size[0] % 2 or args.size[1] % 2:
+            parser.error("--size must be even in both directions for video")
+        os.environ["SDL_VIDEODRIVER"] = "dummy"      # draw without a window
 
     pygame.init()
     monitors = pygame.display.get_desktop_sizes()
+    if args.display is None:
+        args.display = 1 if len(monitors) > 1 else 0
+    if args.record:
+        args.display = 0
     if not 0 <= args.display < len(monitors):
         parser.error(f"--display must be 0 to {len(monitors) - 1}; monitors: "
                      + ", ".join(f"{k}: {w}x{h}"
@@ -265,13 +440,31 @@ def main():
     clock = pygame.time.Clock()
     font = pygame.font.SysFont(None, 22)
 
-    rng = np.random.default_rng(args.seed)
-    worlds = start(rng, len(corners))
-    momenta = [np.zeros_like(pos) for pos in worlds]
+    seed = new_seed() if args.seed is None else args.seed
+    same = args.cutoff == "compare"
+    worlds, momenta = start(seed, len(corners), args.start, args.vrms, same)
+    if args.cutoff == "compare":
+        cutoffs = [True, False]
+        labels = [f"{R_CUT:g} px cutoff", "no cutoff"]
+    else:
+        cutoffs = [args.cutoff == "on"] * len(corners)
+        labels = []
     dynamics = DYNAMICS
     attraction, repulsion = ATTRACTION[dynamics], REPULSION[dynamics]
     trail_keep = TRAIL_KEEP
     paused = False
+
+    recorder = None
+    if args.record:
+        total_frames = round(args.seconds * FPS)
+        settings = (f"{args.panels} panels, {len(worlds[0])} dots each, "
+                    f"cutoff {args.cutoff}, start {args.start}, "
+                    f"vrms {args.vrms}, "
+                    f"density {args.density}, seed {seed}")
+        recorder = Recorder(args.record, screen.get_size(), settings)
+        print(f"Recording {args.seconds:g} s ({total_frames} frames) at "
+              f"{screen_w}x{screen_h} to {args.record}: {settings}")
+        frames_written = 0
 
     # Picture of each world's dots so far, faded a little each frame.
     trails = [pygame.Surface((WIDTH, HEIGHT), depth=32) for _ in worlds]
@@ -279,57 +472,81 @@ def main():
         surface.fill(BACKGROUND)
 
     running = True
-    while running:
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-            elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
+    try:
+        while running:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
                     running = False
-                elif event.key == pygame.K_SPACE:
-                    paused = not paused
-                elif event.key == pygame.K_r:
-                    worlds = start(rng, len(corners))
-                    momenta = [np.zeros_like(pos) for pos in worlds]
-                    for surface in trails:
-                        surface.fill(BACKGROUND)
-                elif event.key == pygame.K_m:
-                    dynamics = ("velocity" if dynamics == "acceleration"
-                                else "acceleration")
-                    attraction = ATTRACTION[dynamics]
-                    repulsion = REPULSION[dynamics]
-                elif event.key == pygame.K_a:
-                    attraction *= 1.25
-                elif event.key == pygame.K_z:
-                    attraction /= 1.25
-                elif event.key == pygame.K_s:
-                    repulsion *= 1.25
-                elif event.key == pygame.K_x:
-                    repulsion /= 1.25
-                elif event.key == pygame.K_t:
-                    # Halve the fade rate: trails twice as long.
-                    trail_keep = 1 - (1 - trail_keep) / 2
-                elif event.key == pygame.K_g:
-                    trail_keep = max(0.0, 1 - (1 - trail_keep) * 2)
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        running = False
+                    elif event.key == pygame.K_SPACE:
+                        paused = not paused
+                    elif event.key == pygame.K_r:
+                        seed = new_seed()
+                        worlds, momenta = start(seed, len(corners),
+                                                args.start, args.vrms, same)
+                        for surface in trails:
+                            surface.fill(BACKGROUND)
+                    elif event.key == pygame.K_m:
+                        dynamics = ("velocity" if dynamics == "acceleration"
+                                    else "acceleration")
+                        attraction = ATTRACTION[dynamics]
+                        repulsion = REPULSION[dynamics]
+                    elif event.key == pygame.K_a:
+                        attraction *= 1.25
+                    elif event.key == pygame.K_z:
+                        attraction /= 1.25
+                    elif event.key == pygame.K_s:
+                        repulsion *= 1.25
+                    elif event.key == pygame.K_x:
+                        repulsion /= 1.25
+                    elif event.key == pygame.K_t:
+                        # Halve the fade rate: trails twice as long.
+                        trail_keep = 1 - (1 - trail_keep) / 2
+                    elif event.key == pygame.K_g:
+                        trail_keep = max(0.0, 1 - (1 - trail_keep) * 2)
 
-        screen.fill(DIVIDER_COLOUR)
-        for k, corner in enumerate(corners):
-            if not paused:
-                worlds[k], momenta[k] = step(worlds[k], momenta[k], dynamics,
-                                             attraction, repulsion)
-                fade(trails[k], trail_keep)
-            for (x, y), colour in zip(worlds[k], speed_colours(momenta[k])):
-                pygame.draw.circle(trails[k], colour, (int(x), int(y)),
-                                   DOT_RADIUS)
-            screen.blit(trails[k], corner)
+            screen.fill(DIVIDER_COLOUR)
+            for k, corner in enumerate(corners):
+                if not paused:
+                    worlds[k], momenta[k] = step(worlds[k], momenta[k],
+                                                 dynamics, attraction,
+                                                 repulsion, cutoffs[k])
+                    fade(trails[k], trail_keep)
+                colours = speed_colours(momenta[k])
+                for (x, y), colour in zip(worlds[k], colours):
+                    pygame.draw.circle(trails[k], colour, (int(x), int(y)),
+                                       DOT_RADIUS)
+                screen.blit(trails[k], corner)
 
-        status = (f"{dynamics}   attraction {attraction:.2f}"
-                  f"   repulsion {repulsion:.2f}   trail {trail_keep:.3f}"
-                  f"   {n_dots()} dots per panel"
-                  f"{'   [paused]' if paused else ''}")
-        screen.blit(font.render(status, True, TEXT_COLOUR), (10, 10))
-        pygame.display.flip()
-        clock.tick(FPS)
+            # Panel labels, shown in videos too.
+            for label, (x, y) in zip(labels, corners):
+                screen.blit(font.render(label, True, TEXT_COLOUR),
+                            (x + 10, y + HEIGHT - 26))
+
+            if recorder:
+                recorder.write(screen)
+                frames_written += 1
+                if frames_written % (10 * FPS) == 0:
+                    print(f"  {frames_written / FPS:g} of {args.seconds:g} s",
+                          flush=True)
+                running = frames_written < total_frames
+                continue
+
+            status = (f"{dynamics}   attraction {attraction:.2f}"
+                      f"   repulsion {repulsion:.2f}   trail {trail_keep:.3f}"
+                      f"   {len(worlds[0])} dots per panel   seed {seed}"
+                      f"{'   [paused]' if paused else ''}")
+            screen.blit(font.render(status, True, TEXT_COLOUR), (10, 10))
+            pygame.display.flip()
+            clock.tick(FPS)
+
+    except KeyboardInterrupt:
+        print("Stopped early.")
+    finally:
+        if recorder:
+            recorder.close()
 
     pygame.quit()
 
