@@ -13,8 +13,9 @@ f is zero at r = R0 * sqrt(REPULSION / ATTRACTION), the preferred spacing
 for a single pair.
 The world wraps around at the edges (a torus).
 
-With --charges, half the dots are positive and half negative (q = +1 or
--1), and the 1/r^2 term depends on the pair's charges:
+With --charges, dots are positive or negative (q = +1 or -1): half each,
+or a fraction P negative with --charges P.  The 1/r^2 term depends on the
+pair's charges:
 
     f(r) = -q_i * q_j * ATTRACTION * (R0 / r)**2 - REPULSION * (R0 / r)**4
 
@@ -79,6 +80,7 @@ Usage:
                                          start with no dots and add one at
                                          rest every 0.1 s
     python dots.py --charges             positive and negative dots
+    python dots.py --charges 0.3         30% of them negative
     python dots.py --remove-every 0.1 --seconds 300
                                          start with about 3000 dots on the
                                          grid and remove one every 0.1 s
@@ -194,6 +196,14 @@ def random_momenta(rng, n, vrms):
     p -= p.mean(axis=0)                  # no overall drift of the world
     rms = np.sqrt(np.mean(np.sum(p ** 2, axis=1)))
     return p * (vrms / rms) if rms > 0 else np.zeros((n, 2))
+
+
+def fraction(text):
+    """Parse a fraction from 0 to 1."""
+    value = float(text)
+    if not 0 <= value <= 1:
+        raise argparse.ArgumentTypeError(f"must be from 0 to 1, got {text}")
+    return value
 
 
 def tile_fraction(text):
@@ -390,14 +400,25 @@ def step(pos, p, dynamics, attraction, repulsion, cutoff=True, q=None):
     return pos, p
 
 
-def start(seed, n_worlds, layout, vrms, same=False, charged=False):
+def starting_charges(rng, n, negative):
+    """Charge +1 or -1 for each of n dots, a fraction negative of them -1."""
+    # Spread ceil(n * negative) negatives evenly through the slots (every
+    # other one at 0.5), then shuffle.  The small allowance stops float
+    # rounding (10 * 0.3 is just over 3) from adding a negative.
+    slot = np.arange(n)
+    is_negative = (np.ceil((slot + 1) * negative - 1e-9)
+                   > np.ceil(slot * negative - 1e-9))
+    return rng.permutation(np.where(is_negative, -1.0, 1.0))
+
+
+def start(seed, n_worlds, layout, vrms, same=False, negative=None):
     """Starting positions, internal velocities and charges for each world.
 
     World k draws its random numbers from seed + k, or from seed for every
     world if same is true.  Each world's random number generator is
-    returned too, for placing dots added later.  With charged, half the
-    dots (chosen at random) are positive and half negative; otherwise the
-    charges are None.
+    returned too, for placing dots added later.  With negative (a fraction),
+    that fraction of the dots, chosen at random, are negative and the rest
+    positive; otherwise the charges are None.
     """
     worlds, momenta, rngs, charges = [], [], [], []
     for k in range(n_worlds):
@@ -412,8 +433,8 @@ def start(seed, n_worlds, layout, vrms, same=False, charged=False):
         momenta.append(random_momenta(rng, len(pos), vrms)
                        if vrms > 0 and len(pos) > 0 else np.zeros_like(pos))
         # Charges are drawn last, so uncharged runs repeat as before.
-        charges.append(rng.permutation(np.arange(len(pos)) % 2 * 2 - 1)
-                       .astype(float) if charged else None)
+        charges.append(None if negative is None
+                       else starting_charges(rng, len(pos), negative))
         rngs.append(rng)
     return worlds, momenta, rngs, charges
 
@@ -508,8 +529,9 @@ def main():
                         "ignore each other (faster); compare: two panels "
                         "with identical starts, cutoff on the left and none "
                         "on the right")
-    parser.add_argument("--charges", action="store_true",
-                        help="half the dots positive and half negative: like "
+    parser.add_argument("--charges", type=fraction, nargs="?", const=0.5,
+                        metavar="P", help="positive and negative dots, a "
+                        "fraction P of them negative (default 0.5): like "
                         "charges repel and opposite charges attract (the "
                         "short-range repulsion is the same for all)")
     parser.add_argument("--tile", type=tile_fraction, nargs="?", const=0.5,
@@ -621,8 +643,9 @@ def main():
                     + (f"add every {args.add_every:g} s, "
                        if args.add_every else "")
                     + (f"remove every {args.remove_every:g} s, "
-                       if args.remove_every else "") +
-                    f"{'charges, ' if args.charges else ''}"
+                       if args.remove_every else "")
+                    + (f"charges {args.charges:g} negative, "
+                       if args.charges is not None else "") +
                     f"density {args.density}, seed {seed}")
         recorder = Recorder(args.record, screen.get_size(), settings)
         length = (f"{args.seconds:g} s ({total_frames} frames)"
@@ -685,9 +708,12 @@ def main():
                         worlds[k] = np.vstack([worlds[k],
                                                scatter(rngs[k], 1)])
                         momenta[k] = np.vstack([momenta[k], np.zeros((1, 2))])
-                        if args.charges:          # either kind, at random
+                        if args.charges is not None:
+                            # Negative with probability args.charges.
                             charges[k] = np.append(
-                                charges[k], rngs[k].choice([-1.0, 1.0]))
+                                charges[k],
+                                -1.0 if rngs[k].random() < args.charges
+                                else 1.0)
                 # Remove a dot chosen at random every remove_every seconds,
                 # and once every world is empty, stop recording one
                 # interval later.
@@ -697,7 +723,7 @@ def main():
                             gone = rngs[k].integers(len(worlds[k]))
                             worlds[k] = np.delete(worlds[k], gone, axis=0)
                             momenta[k] = np.delete(momenta[k], gone, axis=0)
-                            if args.charges:
+                            if args.charges is not None:
                                 charges[k] = np.delete(charges[k], gone)
                     if end_frame is None and not any(map(len, worlds)):
                         end_frame = frame + round(args.remove_every * FPS)
@@ -739,7 +765,9 @@ def main():
             status = (f"{dynamics}   attraction {attraction:.2f}"
                       f"   repulsion {repulsion:.2f}   trail {trail_keep:.3f}"
                       f"   {len(worlds[0])} dots per panel"
-                      f"{'   charges' if args.charges else ''}   seed {seed}"
+                      + (f"   {np.sum(charges[0] < 0)} negative"
+                         if args.charges is not None else "")
+                      + f"   seed {seed}"
                       f"{'   [paused]' if paused else ''}")
             screen.blit(font.render(status, True, TEXT_COLOUR), (10, 10))
             pygame.display.flip()
